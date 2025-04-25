@@ -1,0 +1,21 @@
+{
+  "params": {
+    "batch": 8,
+    "heads": 32,
+    "groups": 8,
+    "kv_seqlen": 65536
+  },
+  "results": {
+    "dim_32": {
+      "latency_ms": 1.6158720254898071,
+      "tflops": 1.3289936418999826,
+      "config": {
+        "block_N": 64,
+        "block_H": 64,
+        "num_split": 1,
+        "num_stages": 1,
+        "threads": 128
+      }
+    }
+  }
+}

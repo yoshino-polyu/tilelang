@@ -18,6 +18,36 @@ from tilelang.engine.param import KernelParam
 from tilelang.jit.adapter import BaseKernelAdapter
 from tilelang.profiler.bench import do_bench
 
+import inspect
+from typing import get_origin, get_args
+
+def print_callable_info(func):
+    """
+    Print the names, annotations (types) and defaults of a callable's parameters,
+    plus its annotated return type.
+    """
+    sig = inspect.signature(func)
+    params = sig.parameters
+    return_annotation = sig.return_annotation
+
+    print(f"Callable: {func.__name__}\n")
+
+    if params:
+        print("Parameters:")
+        for name, param in params.items():
+            # annotation or None
+            ann = None if param.annotation is inspect._empty else param.annotation
+            # default or None
+            default = None if param.default is inspect._empty else param.default
+            print(f"  • {name}")
+            print(f"    – annotation: {ann}")
+            print(f"    – default   : {default}")
+    else:
+        print("Parameters: (none)")
+
+    # Return annotation
+    ret = None if return_annotation is inspect._empty else return_annotation
+    print(f"\nReturn annotation: {ret}")
 
 @dataclass
 class Profiler:
@@ -39,9 +69,14 @@ class Profiler:
         """Initialize tensor supply after dataclass initialization"""
         self.result_idx = self._legalize_result_idx(self.result_idx)
         self.supply = get_tensor_supply(self.supply_type)
+        print(f"[__post_init__] self.supply={self.supply}")
+        print(f"[__post_init__] Type of self.supply={type(self.supply).__name__}")
+        print(f"[__post_init__] Is self.supply callable? {callable(self.supply)}")
+        print_callable_info(self.supply)
 
     def _legalize_result_idx(self, result_idx: Optional[List[int]] = None) -> List[int]:
-        params = self.params
+        params = self.params # place to initialize the params.
+        print(f"[__legalize_result_idx] result_idx={result_idx}")
         # result_idx is a list of indices of the output tensors
         if result_idx is None:
             result_idx = []
@@ -97,7 +132,14 @@ class Profiler:
         torch.cuda.synchronize()
         lib_outs = self.func(*ins)
         torch.cuda.synchronize()
-
+        
+        print("[assert_allclose] Shapes of outputs:")
+        print(f"  lib_outs: {lib_outs.shape}")    
+        print(f"  ref_outs: {ref_outs.shape}")
+        print("--------------------------------")
+        print("[assert_allclose] Contents of outputs: ")
+        print(f"  lib_outs: {lib_outs}")
+        print(f"  ref_outs: {ref_outs}")
         if isinstance(lib_outs, torch.Tensor):
             lib_outs = [lib_outs]
         if isinstance(ref_outs, torch.Tensor):
@@ -185,6 +227,7 @@ class Profiler:
             float: Average execution time in milliseconds
         """
         profiler = self.determine_profiler(func)
+        print(f"[do_bench] profiler={profiler}")
         if profiler == "torch":
             if func is None:
                 assert self.adapter is not None, "benchmarking function should be provided"

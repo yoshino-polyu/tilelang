@@ -44,7 +44,7 @@ class LibraryGenerator(object):
             libpath = src.name.replace(".cu", ".so")
 
             command = [
-                "nvcc",
+                "/usr/local/cuda/bin/nvcc",
                 "-std=c++17",
                 "-w",  # Disable all warning messages
                 "-Xcudafe",

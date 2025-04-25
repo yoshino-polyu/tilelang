@@ -6,115 +6,16 @@ import tilelang.language as T
 from einops import rearrange, einsum
 import argparse
 import itertools
-import json
-import os
-from datetime import datetime
 
 torch.random.manual_seed(0)
 
-# ================================
-# PyTorch Implementation
-# ================================
 
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
-
-def flash_attention(
-    q: torch.Tensor,  # [bsz, num_q_heads, qlen(=1), dim]
-    k: torch.Tensor,  # [bsz, num_k_heads, max_length, dim]
-    v: torch.Tensor,  # [bsz, num_k_heads, max_length, dim]
-    mask: torch.Tensor,  # [bsz, num_k_heads, max_length]
-    valid_length: int,
-    num_k_heads: int,
-):
-    bsz, num_q_heads, _, dim = q.shape
-    k = k[:bsz*num_k_heads*valid_length*dim].view(bsz, num_k_heads, valid_length, dim)
-    v = v[:bsz*num_k_heads*valid_length*dim].view(bsz, num_k_heads, valid_length, dim)
-    attn_out, attn_lse, _ = flash_attn_func(
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        return_attn_probs=True,
-    )
-    return attn_lse, attn_out.transpose(1, 2)
-
-
-def flash_decoding(
-    q: torch.Tensor,  # [bsz, num_q_heads, qlen(=1), dim]
-    k: torch.Tensor,  # [bsz, num_k_heads, max_length, dim]
-    v: torch.Tensor,  # [bsz, num_k_heads, max_length, dim]
-    mask: torch.Tensor,  # [bsz, num_k_heads, max_length]
-    valid_length: int,
-    num_k_heads: int,
-):
-    bsz, num_q_heads, _, dim = q.shape
-    k = k[:bsz*num_k_heads*valid_length*dim].view(bsz, num_k_heads, valid_length, dim)
-    v = v[:bsz*num_k_heads*valid_length*dim].view(bsz, num_k_heads, valid_length, dim)
-    attn_out, attn_lse = flash_attn_with_kvcache(
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        return_softmax_lse=True,
-    )
-    return attn_lse, attn_out.transpose(1, 2)
-
-
-def profile(func, inputs, num_warmups=100, num_iters=100):
-    torch.cuda.synchronize()
-    for _ in range(num_warmups):
-        func(*inputs)
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(num_iters):
-        func(*inputs)
-    end.record()
-    torch.cuda.synchronize()
-    latency = start.elapsed_time(end) / num_iters
-    return latency
-
-
-def profile_all(funcs, inputs):
-    results = {}
-    max_tag_length = max(map(len, funcs.keys()))
-    for tag, func in funcs.items():
-        latency = profile(func, inputs)
-        results[tag] = latency
-        print(f'{tag:{max_tag_length}} : {latency:5.3f} ms')
-    return results
-
-
-def test_masked_decoding(
-    bsz: int,
-    num_k_heads: int,
-    num_q_heads: int,
-    max_length: int,
-    dim: int,
-    device: torch.device = 'cuda',
-    dtype: torch.dtype = torch.float16,
-):
-    # print(f'bsz={bsz}, num_k_heads={num_k_heads}, num_q_heads={num_q_heads}, max_length={max_length}, dim={dim}')
-    q = torch.randn((bsz, num_q_heads, 1, dim), dtype=dtype, device=device)
-    k = torch.randn((bsz*num_k_heads*max_length*dim, ), dtype=dtype, device=device)
-    v = torch.randn((bsz*num_k_heads*max_length*dim, ), dtype=dtype, device=device)
-    mask = torch.randint(0, 2, (bsz*num_k_heads*max_length, ), dtype=torch.bool, device=device)
-    valid_length = max_length // 2
-    inputs = [q, k, v, mask, valid_length, num_k_heads]
-    
-    return profile_all({
-        'flash_attn': flash_attention,
-        'flash_decoding': flash_decoding,
-    }, inputs)
-
-# ================================
-# Tilelang Implementation
-# ================================
 def get_configs():
     block_N = [64, 128]
-    block_H = [16, 32, 64] 
-    num_split = [2, 4, 8, 16, 32, 64]
+    block_H = [64]
+    num_split = [2, 4, 8]
     num_stages = [1, 2, 3]
-    threads = [128, 256] # ???
+    threads = [128]
     _configs = list(itertools.product(block_N, block_H, num_split, num_stages, threads))
 
     configs = [{
@@ -128,20 +29,18 @@ def get_configs():
 
 
 def flashattn(batch, heads, groups, seqlen_kv, dim, tune=False):
-    scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e) / sqrt(dim)
+    scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
     shape_q = [batch, heads, dim]
     shape_k = [batch, seqlen_kv, groups, dim]
     shape_v = [batch, seqlen_kv, groups, dim]
     shape_o = [batch, heads, dim]
     dtype = "float16"
     accum_dtype = "float"
-    # compute in FP16 but accumulate in FP32.
-    kv_group_num = heads // groups # heads = q heads, groups = kv heads, q-heads per kv-group = 32/8 = 4
+    kv_group_num = heads // groups
 
     def kernel_func(block_N, block_H, num_split, num_stages, threads):
-        
         part_shape = [batch, heads, num_split, dim]
-        valid_block_H = min(block_H, kv_group_num) # valid_block_H = kv_group_num = 4
+        valid_block_H = min(block_H, kv_group_num)
 
         @T.macro
         def flash_attn(
@@ -151,45 +50,35 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, tune=False):
                 mask: T.Tensor([batch, seqlen_kv, groups], "uint8"),
                 Output: T.Tensor([batch, heads, dim], dtype),
         ):
-            # assume block_H = 16, block_N = 64, num_split = 1, num_stages = 1
             with T.Kernel(
                     batch, heads // valid_block_H, num_split, threads=threads) as (bx, by, bz):
                 Q_shared = T.alloc_shared([block_H, dim], dtype)
                 K_shared = T.alloc_shared([block_N, dim], dtype)
                 V_shared = T.alloc_shared([block_N, dim], dtype)
                 O_shared = T.alloc_shared([valid_block_H, dim], dtype)
-                acc_s = T.alloc_fragment([block_H, block_N], accum_dtype) # attention map, [16, 64]
-                acc_s_cast = T.alloc_fragment([block_H, block_N], dtype) # the later GEMM
-                ################## variables for online softmax
+                acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
+                acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
                 mask_local = T.alloc_fragment([block_N], "uint8")
                 acc_o = T.alloc_fragment([block_H, dim], accum_dtype)
-                scores_max = T.alloc_fragment([block_H], accum_dtype) # store row max
+                scores_max = T.alloc_fragment([block_H], accum_dtype)
                 scores_max_prev = T.alloc_fragment([block_H], accum_dtype)
                 scores_scale = T.alloc_fragment([block_H], accum_dtype)
                 scores_sum = T.alloc_fragment([block_H], accum_dtype)
                 logsum = T.alloc_fragment([block_H], accum_dtype)
-                ################## variables for online softmax
 
-                bid = bx # batch id, = 0
-                hid = by # head id, in [0, 7]
-                cur_kv_head = hid // (kv_group_num // valid_block_H) # current kv head id
+                bid = bx
+                hid = by
+                cur_kv_head = hid // (kv_group_num // valid_block_H)
 
-                T.copy(Q[bid, hid * valid_block_H:hid * valid_block_H + block_H, :], Q_shared) 
-                # bid = 0, hid = 0, 0:16 => Q_shared
-                # bid = 0, hid = 1, 4:20 => Q_shared
-                # bid = 0, hid = 2, 8:24 => Q_shared
-                # bid = 0, hid = 3, 12:28 => Q_shared
-                # bid = 0, hid = 4, 16:32 => Q_shared
+                T.copy(Q[bid, hid * valid_block_H:hid * valid_block_H + block_H, :], Q_shared)
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
 
-                loop_range = T.ceildiv((seqlen_kv // num_split), block_N) # split seqlen_kv = flash decoding
+                loop_range = T.ceildiv((seqlen_kv // num_split), block_N)
                 for k in T.Pipelined(loop_range, num_stages=num_stages):
                     T.copy(K[bid, k * block_N:(k + 1) * block_N, cur_kv_head, :], K_shared)
-                    # bid = 0, k = 0, [0,0:64,0,:] 
-                    T.copy(mask[bid, k * block_N:(k + 1) * block_N, cur_kv_head], mask_local) # masking for causality
-                    # bid = 0, k = 0, [0,0:64,0], mask_local is applied column-wise
+                    T.copy(mask[bid, k * block_N:(k + 1) * block_N, cur_kv_head], mask_local)
                     T.clear(acc_s)
                     T.gemm(
                         Q_shared,
@@ -197,18 +86,16 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, tune=False):
                         acc_s,
                         transpose_B=True,
                         policy=T.GemmWarpPolicy.FullRow)
-                    # apply mask to attention map
                     for i, j in T.Parallel(block_H, block_N):
                         acc_s[i, j] = T.if_then_else(mask_local[j] != 0, acc_s[i, j],
                                                      -T.infinity(accum_dtype))
-                    # row-wise online softmax
-                    T.copy(scores_max, scores_max_prev) # backup
+                    T.copy(scores_max, scores_max_prev)
                     T.fill(scores_max, -T.infinity(accum_dtype))
-                    T.reduce_max(acc_s, scores_max, dim=1, clear=False) # row max
+                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                     for i in T.Parallel(block_H):
-                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale) # alpha
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
                     for i, j in T.Parallel(block_H, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale) # 
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
                     T.reduce_sum(acc_s, scores_sum, dim=1)
                     for i in T.Parallel(block_H):
                         logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
@@ -217,7 +104,6 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, tune=False):
                         acc_o[i, j] *= scores_scale[i]
                     T.copy(V[bid, k * block_N:(k + 1) * block_N, cur_kv_head, :], V_shared)
                     T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-                    
                 for i, j in T.Parallel(block_H, dim):
                     acc_o[i, j] /= logsum[i]
                 for i in T.Parallel(block_H):
@@ -377,7 +263,7 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, tune=False):
                 Output: T.Tensor(shape_o, dtype),
         ):
             flash_attn(Q, K, V, mask, Output)
-        
+
         if num_split > 1:
             return main_split
         else:
@@ -387,7 +273,7 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, tune=False):
 
         @autotune(
             configs=get_configs(),
-            # keys=["block_N", "block_H", "num_split", "num_stages", "threads"],
+            keys=["block_N", "block_H", "num_split", "num_stages", "threads"],
             warmup=10,
             rep=10)
         @jit(
@@ -444,67 +330,132 @@ def ref_program(query, key, value, mask, glse, Output_partial):
     return out
 
 
+def flash_split_ref(Q, K, V, mask):
+    num_split = 8
+    batch = Q.size(0)
+    nheads = Q.size(1)
+    groups = K.size(2)
+    dim = Q.size(-1)
+    block_N = 32
+    seqlen_kv = K.size(1)
+    num_head_groups = nheads // groups
+
+    scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
+    acc_s = torch.empty((batch, num_head_groups, groups, block_N), device="cuda", dtype=torch.float)
+    acc_s_cast = torch.empty((batch, num_head_groups, groups, block_N),
+                             device="cuda",
+                             dtype=torch.float16)
+    acc_o = torch.empty((batch, num_head_groups, groups, dim), device="cuda", dtype=torch.float)
+    scores_max = torch.empty((batch, num_head_groups, groups), device="cuda", dtype=torch.float)
+    scores_max_prev = torch.empty((batch, num_head_groups, groups),
+                                  device="cuda",
+                                  dtype=torch.float)
+    scores_scale = torch.empty((batch, num_head_groups, groups), device="cuda", dtype=torch.float)
+    scores_sum = torch.empty((batch, num_head_groups, groups), device="cuda", dtype=torch.float)
+    logsum = torch.empty((batch, num_head_groups, groups), device="cuda", dtype=torch.float)
+    gacc_o = torch.empty((num_split, batch, nheads, dim), device="cuda", dtype=torch.float)
+    glogsum = torch.empty((num_split, batch, nheads), device="cuda", dtype=torch.float)
+
+    Q_ = Q * scale
+    Q_ = rearrange(Q_, 'b (h g) d -> b g h d', g=num_head_groups)
+
+    for ks in range(num_split):
+        acc_o.fill_(0)
+        logsum.fill_(0)
+        scores_max.fill_(float('-inf'))
+        scores_max_prev.fill_(float('-inf'))
+        for i in range(int((seqlen_kv // num_split) / block_N)):
+            acc_s.fill_(0)
+            acc_s = torch.einsum('bghd,bkhd->bghk', Q_,
+                                 K[:, (seqlen_kv // num_split) * ks +
+                                   i * block_N:(seqlen_kv // num_split) * ks +
+                                   (i + 1) * block_N, :, :])  # [batch, nheads, block_N]
+            if mask is not None:
+                mask_local = mask[:, (seqlen_kv // num_split) * ks +
+                                  i * block_N:(seqlen_kv // num_split) * ks + (i + 1) * block_N, :]
+                mask_local = rearrange(mask_local, 'b s h -> b h s')
+                mask_local = mask_local.unsqueeze(1)
+                acc_s = acc_s.masked_fill(mask_local == 0, float('-inf'))
+            scores_max_prev = scores_max
+            scores_max = acc_s.max(dim=-1, keepdim=False).values  # [batch, nheads]
+            scores_scale = torch.exp2(scores_max_prev - scores_max)  # [batch, nheads]
+            acc_o *= scores_scale[:, :, :, None]
+            acc_s = torch.exp2(acc_s - scores_max[:, :, :, None])
+            acc_s_cast = acc_s.to(torch.float16)  # [batch, nheads, block_N]
+            acc_o += torch.einsum(
+                'bghk,bkhd->bghd', acc_s_cast,
+                V[:, (seqlen_kv // num_split) * ks + i * block_N:(seqlen_kv // num_split) * ks +
+                  (i + 1) * block_N, :, :])
+            scores_sum = acc_s.sum(dim=-1, keepdim=False)
+            logsum = logsum * scores_scale + scores_sum
+        acc_o_out = rearrange(acc_o, 'b g h d->b (h g) d')
+        logsum_out = rearrange(logsum, 'b g h->b (h g)')
+        acc_o_out /= logsum_out[:, :, None]
+        logsum_out = torch.log2(logsum_out) + rearrange(scores_max, 'b g h->b (h g)')
+        gacc_o[ks, :, :, :] = acc_o_out
+        glogsum[ks, :, :] = logsum_out
+
+    return glogsum.to(torch.float16).permute(1, 2, 0), gacc_o.to(torch.float16).permute(1, 2, 0, 3)
+
+
+def reduce_ref(Q, K, V, mask, glse, Output_partial):
+    num_split = 8
+    o = torch.empty_like(Output_partial[:, :, 0, :]).fill_(0)
+    lse_logsum = torch.empty_like(glse[:, :, 0]).fill_(0)  # [batch, heads]
+    lse_max = glse.max(dim=2, keepdim=False).values
+    for ks in range(num_split):
+        lse = glse[:, :, ks]
+        lse_logsum += torch.exp2(lse - lse_max)
+    lse_logsum = torch.log2(lse_logsum) + lse_max
+    for ks in range(num_split):
+        lse = glse[:, :, ks]
+        scale = torch.exp2(lse - lse_logsum)  # [batch, heads]
+        o += Output_partial[:, :, ks, :] * scale[:, :, None]
+    return o.to(torch.float16)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--batch', type=int, default=1, help='batch size')
     parser.add_argument('--heads', type=int, default=32, help='heads')
     parser.add_argument('--groups', type=int, default=8, help='groups')
-    parser.add_argument('--kv_seqlen', type=int, default=65536, help='kv sequence length') # original 8192
-    parser.add_argument('--dim', type=int, default=32, help='dim')
+    parser.add_argument('--kv_seqlen', type=int, default=8192, help='kv sequence length')
+    parser.add_argument('--dim', type=int, default=128, help='dim')
     parser.add_argument('--tune', action='store_true', help='tune configs')
-    parser.add_argument('--log_dir', type=str, default='logs', help='directory to save logs')
     args = parser.parse_args()
-    
-    batch, heads, groups, kv_seqlen = args.batch, args.heads, args.groups, args.kv_seqlen
-    # qk_flops = 2 * batch * heads * kv_seqlen * dim
-    # pv_flops = 2 * batch * heads * kv_seqlen * dim
-    # total_flops = qk_flops + pv_flops
-    
-    # Create log directory if it doesn't exist
-    os.makedirs(args.log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{args.log_dir}/flash_attn_benchmark_{timestamp}.json"
-    
-    log_results = {
-        "params": {
-            "batch": batch,
-            "heads": heads,
-            "groups": groups,
-            "kv_seqlen": kv_seqlen
-        },
-        "results": {}
-    }
-    
-    def get_heuristic_config() -> dict:
-        # Get CUDA device properties
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available")
-        device = torch.cuda.current_device()
-        sm_major, sm_minor = torch.cuda.get_device_capability(device)
-        sm_version = sm_major * 10 + sm_minor
-        print(f"CUDA device capability: {sm_version}")
-        if sm_version == 89:
-            return {
-                "block_N": 128,
-                "block_H": 64,
-                "num_split": 8,
-                "num_stages": 0,
-                "threads": 128
-            }
-        else:
-            return {
-                "block_N": 64,
-                "block_H": 64,
-                "num_split": 1,
-                "num_stages": 1,
-                "threads": 128
-            }
-    
-    for dim in [32]:
-        print(f"!!!!!!!!!!!!!!!!!! tilelang dim={dim} !!!!!!!!!!!!!!!!!!")
-        qk_flops = 2 * batch * heads * kv_seqlen * dim
-        pv_flops = 2 * batch * heads * kv_seqlen * dim
-        total_flops = qk_flops + pv_flops
+
+    batch, heads, groups, kv_seqlen, dim = args.batch, args.heads, args.groups, args.kv_seqlen, args.dim
+    qk_flops = 2 * batch * heads * kv_seqlen * dim
+    pv_flops = 2 * batch * heads * kv_seqlen * dim
+    total_flops = qk_flops + pv_flops
+
+    if (not args.tune):
+
+        def get_heuristic_config() -> dict:
+            # Get CUDA device properties
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is not available")
+            device = torch.cuda.current_device()
+            sm_major, sm_minor = torch.cuda.get_device_capability(device)
+            sm_version = sm_major * 10 + sm_minor
+            print(f"CUDA device capability: {sm_version}")
+            if sm_version == 89:
+                return {
+                    "block_N": 128,
+                    "block_H": 64,
+                    "num_split": 8,
+                    "num_stages": 0,
+                    "threads": 128
+                }
+            else:
+                return {
+                    "block_N": 128,
+                    "block_H": 64,
+                    "num_split": 8,
+                    "num_stages": 2,
+                    "threads": 128
+                }
+
         config = get_heuristic_config()
         program = flashattn(batch, heads, groups, kv_seqlen, dim, tune=args.tune)(**config)
         kernel = tilelang.compile(program, out_idx=[6])
@@ -517,77 +468,11 @@ if __name__ == "__main__":
         latency = profiler.do_bench(warmup=500)
         print("Tile-lang: {:.2f} ms".format(latency))
         print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
-        log_results["results"][f"dim_{dim}"] = {
-            "latency_ms": latency,
-            "tflops": total_flops / latency * 1e-9,
-            "config": config
-        }
-        print("================================================================")
-    
-    # # Write results to JSON file
-    with open(log_filename, 'w') as f:
-        json.dump(log_results, f, indent=2)
-    print(f"Results logged to {log_filename}")
-
-    # Create log directory if it doesn't exist
-    # os.makedirs(args.log_dir, exist_ok=True)
-    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # log_filename = f"{args.log_dir}/flash_attn_benchmark_{timestamp}.json"
-    
-    # log_results = {
-    #     "params": {
-    #         "batch": batch,
-    #         "heads": heads,
-    #         "groups": groups,
-    #         "kv_seqlen": kv_seqlen
-    #     },
-    #     "results": {}
-    # }
-    
-    # for dim in [32, 48, 64, 80, 96, 112]:
-    #     print(f"!!!!!!!!!!!!!!!!!! tilelang[tuned] dim={dim} !!!!!!!!!!!!!!!!!!")
-    #     # Calculate FLOPs for this dimension
-    #     qk_flops = 2 * batch * heads * kv_seqlen * dim
-    #     pv_flops = 2 * batch * heads * kv_seqlen * dim
-    #     total_flops = qk_flops + pv_flops
-        
-    #     best_result = flashattn(batch, heads, groups, kv_seqlen, dim, tune=args.tune)
-    #     best_latency = best_result.latency
-    #     best_config = best_result.config
-    #     ref_latency = best_result.ref_latency
-    #     tflops = total_flops / best_latency * 1e-9
-        
-    #     # Store results in dictionary
-    #     log_results["results"][f"dim_{dim}"] = {
-    #         "latency_ms": best_latency,
-    #         "tflops": tflops,
-    #         "config": best_config,
-    #         "ref_latency_ms": ref_latency
-    #     }
-    
-    #     print(f"Best latency: {best_latency}")
-    #     print(f"Best TFlops: {tflops}")
-    #     print(f"Best config: {best_config}")
-    #     print("================================================================")
-    
-    # # Write results to JSON file
-    # with open(log_filename, 'w') as f:
-    #     json.dump(log_results, f, indent=2)
-    # print(f"Results logged to {log_filename}")
-
-    # print("================================================================")
-    # from tqdm import tqdm
-    # import pandas as pd
-    # df = []
-    # for dim in tqdm([32, 64, 96, 128]):
-    #     results = test_masked_decoding(
-    #         bsz=1,
-    #         num_k_heads=8,
-    #         num_q_heads=32,
-    #         max_length=131072,
-    #         dim=dim,
-    #     )
-    #     df.append(pd.DataFrame({dim: results}).T)
-    # df = pd.concat(df).round(3)
-    # df.index.name = 'dim'
-    # print(df)
+    else:
+        best_result = flashattn(batch, heads, groups, kv_seqlen, dim, tune=args.tune)
+        best_latency = best_result.latency
+        best_config = best_result.config
+        ref_latency = best_result.ref_latency
+        print(f"Best latency: {best_latency}")
+        print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
+        print(f"Best config: {best_config}")]

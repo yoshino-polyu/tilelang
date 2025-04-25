@@ -78,11 +78,9 @@ class JITKernel(object):
         self.target = target
         self.target_host = target_host
         self.verbose = verbose
-
         if pass_configs is None:
             pass_configs = {}
         self.pass_configs = pass_configs
-
         # If the target is specified as a string, validate it and convert it to a TVM Target.
         if isinstance(target, str):
             assert target in AVALIABLE_TARGETS, f"Invalid target: {target}"
@@ -190,7 +188,10 @@ class JITKernel(object):
 
         execution_backend = self.execution_backend
         pass_configs = self.pass_configs
-
+        # Print compilation target information
+        print(f"[_compile_and_create_adapter] Target: {target}")
+        print(f"[_compile_and_create_adapter] Target host: {target_host}")
+        print(f"[_compile_and_create_adapter] Execution backend: {execution_backend}")
         # Compile the function with TVM, optimizing with shared memory lowering.
         enable_host_codegen = execution_backend == "dlpack"
         enable_device_compile = execution_backend == "dlpack"
@@ -315,6 +316,7 @@ class JITKernel(object):
         Profiler
             A Profiler instance for benchmarking the runtime module.
         """
+        print(f"[_get_profiler] self.params={self.params}")
         return Profiler(self.params, self.out_idx,
                         tensor_supply_type).with_default_adapter(self.adapter)
 
